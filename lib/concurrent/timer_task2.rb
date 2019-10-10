@@ -10,8 +10,6 @@ module Concurrent
   # task thread is intended to run for days/weeks/years a crashed task thread
   # can pose a significant problem. `TimerTask2` alleviates both problems.
   #
-  # TODO: Update this
-  #
   # When a `TimerTask2` is launched it starts a thread for monitoring the
   # execution interval. The `TimerTask2` thread does not perform the task,
   # however. Instead, the TimerTask2 launches the task on a separate thread.
@@ -46,8 +44,8 @@ module Concurrent
   #
   # @example Configuring `:execution_interval` and `:timeout_interval`
   #   task = Concurrent::TimerTask2.new(execution_interval: 5, timeout_interval: 5) do
-  #          puts 'Boom!'
-  #        end
+  #     puts 'Boom!'
+  #   end
   #
   #   task.execution_interval #=> 5
   #   task.timeout_interval   #=> 5
@@ -61,7 +59,7 @@ module Concurrent
   # @example Controlling execution from within the block
   #   channel = Concurrent::Promises::Channel.new 1
   #   timer_task = Concurrent::TimerTask2.new(execution_interval: 1, channel: channel) do |task, cancellation|
-  #     task.execution_interval.times{ print 'Boom! ' }
+  #     task.execution_interval.to_i.times{ print 'Boom! ' }
   #     print "\n"
   #     task.execution_interval += 1
   #     if task.execution_interval > 5
@@ -81,15 +79,16 @@ module Concurrent
   #
   # @example Observation
   #   channel = Concurrent::Promises::Channel.new
-  #   # TODO: Make sure this works
   #   observe = ->(channel) do
-  #    channel.pop_op.then do |(success, result, error)|
-  #       if result
+  #     channel.pop_op.then do |(success, result, error)|
+  #       if success
   #         print "(#{success}) Execution successfully returned #{result}\n"
-  #       elsif ex.is_a?(Concurrent::TimeoutError)
-  #         print "(#{success}) Execution timed out\n"
   #       else
-  #         print "(#{success}) Execution failed with error #{ex}\n"
+  #         if error.is_a?(Concurrent::TimeoutError)
+  #           print "(#{success}) Execution timed out\n"
+  #         else
+  #           print "(#{success}) Execution failed with error #{error}\n"
+  #         end
   #       end
   #     end
   #   end
@@ -98,34 +97,36 @@ module Concurrent
   #   task.execute
   #
   #   3.times do
-  #     observe.call(channel)
+  #     observe.call(channel).wait
   #   end
   #
   #   #=> (true) Execution successfully returned 42
   #   #=> (true) Execution successfully returned 42
   #   #=> (true) Execution successfully returned 42
   #   task.shutdown
-  #   channel.pop
   #
-  #   task = Concurrent::TimerTask2.new(execution_interval: 1, timeout_interval: 1, channel: channel) do |_, cancellation|
-  #     raise Concurrent::TimeoutError.new if cancellation.cancelled?
+  #   task = Concurrent::TimerTask2.new(execution_interval: 1, timeout_interval: 0.1, channel: channel) do |_, cancellation|
+  #     until cancellation.cancelled?
+  #       sleep 0.1 # Simulate doing work
+  #     end
+  #
+  #     raise Concurrent::TimeoutError.new
   #   end
   #   task.execute
   #
   #   3.times do
-  #     observe.call(channel)
+  #     observe.call(channel).wait
   #   end
   #   #=> (false) Execution timed out
   #   #=> (false) Execution timed out
   #   #=> (false) Execution timed out
   #   task.shutdown
-  #   channel.pop
   #
   #   task = Concurrent::TimerTask2.new(execution_interval: 1, channel: channel){ raise StandardError }
   #   task.execute
   #
   #   3.times do
-  #     observe.call(channel)
+  #     observe.call(channel).wait
   #   end
   #   #=> (false) Execution failed with error StandardError
   #   #=> (false) Execution failed with error StandardError
@@ -174,7 +175,7 @@ module Concurrent
       raise ArgumentError.new('reschedule must be either :before or :after') unless [nil, :before, :after].include?(opts[:reschedule])
       @execution_interval = AtomicReference.new nil
       @timeout_interval = AtomicReference.new nil
-      @cancellation = AtomicReference.new nil
+      @Cancellation = AtomicReference.new nil
 
       self.execution_interval = opts[:execution] || opts[:execution_interval] || EXECUTION_INTERVAL
       self.timeout_interval = opts[:timeout] || opts[:timeout_interval] || TIMEOUT_INTERVAL
@@ -211,10 +212,15 @@ module Concurrent
     #   task = Concurrent::TimerTask2.new(execution_interval: 10) { print "Hello World\n" }.execute
     #   task.running? #=> true
     def execute
-      return if running?
-      @cancellation.set(Cancellation.new)
-      execute_task @RunNow
+      execute?
       self
+    end
+
+    def execute?
+      return false if running?
+      @Cancellation.set(Cancellation.new)
+      execute_task cancellation, @RunNow
+      true
     end
 
     def shutdown
@@ -223,8 +229,9 @@ module Concurrent
     end
 
     def kill
-      cancellation = @cancellation.get
-      success = @cancellation.compare_and_set cancellation, nil
+      return false unless running?
+      cancellation = @Cancellation.get
+      success = @Cancellation.compare_and_set cancellation, nil
       cancellation.origin.resolve if success
       success
     end
@@ -234,7 +241,7 @@ module Concurrent
     end
 
     def cancellation
-      @cancellation.get
+      @Cancellation.get
     end
 
     # @!attribute [rw] execution_interval
@@ -275,23 +282,23 @@ module Concurrent
 
     private
 
-    def execute_task(first_run = false)
+    def execute_task(cancellation, first_run = false)
       Promises.schedule(first_run ? 0 : execution_interval) do
-        with_rescheduling do |cancellation|
+        with_rescheduling(cancellation) do |cancellation|
           result = @Executor.execute(self, cancellation)
           @Channel.push result if @Channel
         end
       end
     end
 
-    def with_rescheduling
+    def with_rescheduling(cancellation)
       if cancellation.canceled?
         @Channel.push [false, nil, Concurrent::CancelledOperationError.new]
         return
       end
-      execute_task if @Reschedule == :before
+      execute_task(cancellation) if @Reschedule == :before
       yield Cancellation.timeout(timeout_interval).join(cancellation)
-      execute_task if @Reschedule == :after
+      execute_task(cancellation) if @Reschedule == :after
     end
   end
 end
